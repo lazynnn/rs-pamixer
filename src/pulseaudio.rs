@@ -20,6 +20,14 @@ pub struct ServerInfo {
     pub default_source_name: String,
 }
 
+/// Module information
+#[derive(Debug, Clone)]
+pub struct ModuleInfo {
+    pub index: u32,
+    pub name: String,
+    pub argument: String,
+}
+
 /// PulseAudio connection wrapper using ThreadedMainloop
 pub struct PulseAudio {
     mainloop: Mainloop,
@@ -419,6 +427,122 @@ impl PulseAudio {
         self.mainloop.unlock();
 
         rx.recv()?.map_err(|e| anyhow::anyhow!("Failed to move sink input: {}", e))
+    }
+
+    /// Load a module and return its index
+    pub fn load_module(&mut self, name: &str, args: &str) -> Result<u32> {
+        self.mainloop.lock();
+
+        let (tx, rx): (Sender<Result<u32>>, Receiver<Result<u32>>) = mpsc::channel();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+
+        let mut introspector = self.context.introspect();
+        let op = introspector.load_module(name, args, move |idx| {
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(Ok(idx));
+            }
+        });
+
+        self.wait_operation(op);
+        self.mainloop.unlock();
+
+        rx.recv()?.map_err(|e| anyhow::anyhow!("Failed to load module: {}", e))
+    }
+
+    /// Unload a module by index
+    pub fn unload_module(&mut self, index: u32) -> Result<()> {
+        self.mainloop.lock();
+
+        let (tx, rx): (Sender<Result<()>>, Receiver<Result<()>>) = mpsc::channel();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+
+        let mut introspector = self.context.introspect();
+        let op = introspector.unload_module(index, move |success| {
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(if success { Ok(()) } else { Err(anyhow::anyhow!("Failed to unload module")) });
+            }
+        });
+
+        self.wait_operation(op);
+        self.mainloop.unlock();
+
+        rx.recv()?.map_err(|e| anyhow::anyhow!("Failed to unload module: {}", e))
+    }
+
+    /// Create a mirror sink that outputs to multiple sinks simultaneously
+    /// Uses null-sink + loopback approach for better compatibility with mixed sample rates
+    /// Returns the module indices (for later unloading) and the new sink index
+    pub fn create_mirror_sink(&mut self, sink_names: &[&str], sink_name: &str) -> Result<(Vec<u32>, u32)> {
+        let mut module_indices = Vec::new();
+
+        // Step 1: Create a null-sink (virtual sink)
+        let null_args = format!(
+            "sink_name={} rate=48000 sink_properties=device.description=\"{}\"",
+            sink_name, sink_name
+        );
+        let null_module = self.load_module("module-null-sink", &null_args)?;
+        module_indices.push(null_module);
+
+        // Get the null sink's monitor source name
+        let monitor_name = format!("{}.monitor", sink_name);
+
+        // Step 2: Create loopback from null-sink.monitor to each output sink
+        for sink_name_iter in sink_names {
+            let loopback_args = format!("sink={} source={}", sink_name_iter, monitor_name);
+            let loopback_module = self.load_module("module-loopback", &loopback_args)?;
+            module_indices.push(loopback_module);
+        }
+
+        // Find the newly created sink by name
+        let sink = self.get_sink_by_name(sink_name)?;
+        let sink_index = sink.index;
+
+        Ok((module_indices, sink_index))
+    }
+
+    /// Mirror a sink input to multiple sinks using a combine sink
+    /// Returns the module indices for cleanup
+    pub fn mirror_input_to_sinks(&mut self, input_index: u32, sink_names: &[&str]) -> Result<Vec<u32>> {
+        // Create a unique sink name for this mirror
+        let mirror_sink_name = format!("rs_mirror_{}", input_index);
+
+        // Create the combine sink
+        let (module_indices, sink_index) = self.create_mirror_sink(sink_names, &mirror_sink_name)?;
+
+        // Move the input to the new mirror sink
+        self.move_sink_input(input_index, sink_index)?;
+
+        Ok(module_indices)
+    }
+
+    /// Get list of loaded modules
+    pub fn get_modules(&mut self) -> Result<Vec<ModuleInfo>> {
+        let modules: Arc<Mutex<Vec<ModuleInfo>>> = Arc::new(Mutex::new(Vec::new()));
+        let modules_clone = Arc::clone(&modules);
+
+        self.mainloop.lock();
+
+        let introspector = self.context.introspect();
+        let op = introspector.get_module_info_list(move |result| {
+            if let ListResult::Item(info) = result {
+                let mut mods = modules_clone.lock().unwrap();
+                mods.push(ModuleInfo {
+                    index: info.index,
+                    name: info.name.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+                    argument: info.argument.as_ref().map(|s| s.to_string()).unwrap_or_default(),
+                });
+            }
+        });
+
+        self.wait_operation(op);
+        self.mainloop.unlock();
+
+        let modules = Arc::try_unwrap(modules)
+            .map_err(|_| anyhow::anyhow!("Failed to unwrap modules"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("Failed to lock modules"))?;
+
+        Ok(modules)
     }
 
     /// Wait for an operation to complete

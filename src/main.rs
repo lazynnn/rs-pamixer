@@ -93,6 +93,23 @@ struct Args {
     #[arg(long, value_names = &["INPUT_INDEX", "SINK_INDEX"], num_args = 2)]
     move_sink_input: Option<Vec<u32>>,
 
+    /// Mirror a sink input to multiple sinks (creates a combine sink)
+    /// Usage: --mirror INPUT_INDEX SINK_INDEX1 SINK_INDEX2 ...
+    #[arg(long, value_names = &["INPUT_INDEX", "SINK_INDEX"], num_args = 2..)]
+    mirror: Option<Vec<u32>>,
+
+    /// Unload a module by index (for cleanup)
+    #[arg(long, value_name = "MODULE_INDEX")]
+    unload_module: Option<u32>,
+
+    /// Unload multiple modules (for mirror cleanup) - comma-separated indices
+    #[arg(long, value_name = "MODULE_INDICES")]
+    unload_mirror: Option<String>,
+
+    /// List loaded modules
+    #[arg(long)]
+    list_modules: bool,
+
     /// Print version info
     #[arg(short = 'v', long)]
     version: bool,
@@ -110,48 +127,112 @@ fn main() -> Result<()> {
     validate_options(&args)?;
 
     // If just listing or getting info, we don't need device selection
-    if args.list_sinks || args.list_sources || args.list_sink_inputs || args.get_default_sink {
+    if args.list_sinks || args.list_sources || args.list_sink_inputs || args.get_default_sink || args.list_modules {
         let mut pulse = PulseAudio::new("rs-pamixer")?;
-        
+
         if args.list_sinks {
             println!("Sinks:");
             for sink in pulse.get_sinks()? {
-                println!("{} \"{}\" \"{}\" \"{}\"", 
+                println!("{} \"{}\" \"{}\" \"{}\"",
                     sink.index, sink.name, sink.state_string(), sink.description);
             }
         }
-        
+
         if args.list_sources {
             println!("Sources:");
             for source in pulse.get_sources()? {
-                println!("{} \"{}\" \"{}\" \"{}\"", 
+                println!("{} \"{}\" \"{}\" \"{}\"",
                     source.index, source.name, source.state_string(), source.description);
             }
         }
-        
+
         if args.list_sink_inputs {
             println!("Sink Inputs:");
             for input in pulse.get_sink_inputs()? {
                 println!("{} \"{}\" -> sink {}", input.index, input.name, input.sink_index);
             }
         }
-        
+
+        if args.list_modules {
+            println!("Loaded Modules:");
+            for module in pulse.get_modules()? {
+                println!("{} \"{}\" \"{}\"", module.index, module.name, module.argument);
+            }
+        }
+
         if args.get_default_sink {
             let sink = pulse.get_default_sink()?;
             println!("Default sink:");
             println!("{} \"{}\" \"{}\"", sink.index, sink.name, sink.description);
         }
-        
+
         return Ok(());
     }
 
-    // Handle audio routing
+    // Handle audio routing - move sink input
     if let Some(ref indices) = args.move_sink_input {
         let input_index = indices[0];
         let sink_index = indices[1];
         let mut pulse = PulseAudio::new("rs-pamixer")?;
         pulse.move_sink_input(input_index, sink_index)?;
         println!("Moved sink input {} to sink {}", input_index, sink_index);
+        return Ok(());
+    }
+
+    // Handle mirror - create combine sink and route input to it
+    if let Some(ref indices) = args.mirror {
+        if indices.len() < 2 {
+            bail!("--mirror requires at least 2 arguments: INPUT_INDEX SINK_INDEX [SINK_INDEX...]");
+        }
+        let input_index = indices[0];
+        let sink_indices: Vec<u32> = indices[1..].to_vec();
+
+        let mut pulse = PulseAudio::new("rs-pamixer")?;
+
+        // Get sink names from indices
+        let mut sink_names = Vec::new();
+        for sink_idx in &sink_indices {
+            let sink = pulse.get_sink_by_index(*sink_idx)?;
+            sink_names.push(sink.name.clone());
+        }
+
+        // Create mirror sink
+        let mirror_sink_name = format!("rs_mirror_{}", input_index);
+        let sink_name_refs: Vec<&str> = sink_names.iter().map(|s| s.as_str()).collect();
+        let (module_indices, _sink_index) = pulse.create_mirror_sink(&sink_name_refs, &mirror_sink_name)?;
+
+        // Get the newly created mirror sink
+        let mirror_sink = pulse.get_sink_by_name(&mirror_sink_name)?;
+
+        // Move the input to the mirror sink
+        pulse.move_sink_input(input_index, mirror_sink.index)?;
+
+        let module_indices_str: Vec<String> = module_indices.iter().map(|i| i.to_string()).collect();
+        println!("Created mirror sink '{}' routing to sinks: {:?}", mirror_sink_name, sink_indices);
+        println!("Module indices: {} (use --unload-mirror with these indices to cleanup)", module_indices_str.join(","));
+        return Ok(());
+    }
+
+    // Handle unload-mirror - unload multiple modules
+    if let Some(ref modules_str) = args.unload_mirror {
+        let mut pulse = PulseAudio::new("rs-pamixer")?;
+        let module_indices: Vec<u32> = modules_str
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect();
+        
+        for module_index in &module_indices {
+            pulse.unload_module(*module_index)?;
+        }
+        println!("Unloaded modules: {:?}", module_indices);
+        return Ok(());
+    }
+
+    // Handle unload-module
+    if let Some(module_index) = args.unload_module {
+        let mut pulse = PulseAudio::new("rs-pamixer")?;
+        pulse.unload_module(module_index)?;
+        println!("Unloaded module {}", module_index);
         return Ok(());
     }
 
@@ -189,7 +270,7 @@ fn main() -> Result<()> {
     if let Some(limit_value) = args.set_limit {
         let limit_value = limit_value.max(0);
         let limit = percent_to_volume(limit_value);
-        
+
         if device.volume_avg.0 > limit.0 {
             pulse.set_volume(&device, limit)?;
         }
@@ -203,7 +284,7 @@ fn main() -> Result<()> {
         } else {
             args.mute
         };
-        
+
         pulse.set_mute(&device, new_mute)?;
         return Ok(());
     }
